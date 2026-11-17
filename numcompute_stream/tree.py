@@ -1,6 +1,5 @@
 """
-A from-scratch binary decision tree classifier (Gini or entropy), generalising
-classification-tree.html's 0/1-feature design to numeric threshold splits.
+A from-scratch binary decision tree classifier (Gini or entropy)
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ import numpy as np
 
 def gini(y: np.ndarray) -> float:
     """
-    Gini impurity of a group of binary (0/1) labels: 0 when everyone agrees, 0.5 at half and half.
+    Gini impurity of a group of binary labels:
 
     Parameters
     ----------
@@ -148,11 +147,15 @@ class DecisionTreeClassifier:
         each split. If None, every feature is considered.
     random_state : Optional[int], default=None
         Seed for the random feature subset chosen when max_features is set.
+    buffer_size : int, default=100
+        Used by partial_fit: the tree is retrained once this many rows have
+        been buffered since the last retrain (see partial_fit).
 
     Attributes
     ----------
     root : Optional[Node]
-        The trained tree's root node. None until fit is called.
+        The most recently trained tree's root node. None until fit or
+        partial_fit has triggered a retrain.
     """
 
     def __init__(
@@ -162,6 +165,7 @@ class DecisionTreeClassifier:
         min_samples_split: int = 2,
         max_features: Optional[int] = None,
         random_state: Optional[int] = None,
+        buffer_size: int = 100,
     ) -> None:
         if max_depth <= 0:
             raise ValueError("max_depth must be positive.")
@@ -171,18 +175,25 @@ class DecisionTreeClassifier:
             raise ValueError("min_samples_split must be at least 2.")
         if max_features is not None and max_features <= 0:
             raise ValueError("max_features must be positive.")
+        if buffer_size <= 0:
+            raise ValueError("buffer_size must be positive.")
 
         self.max_depth = max_depth
         self.criterion = criterion
         self.min_samples_split = min_samples_split
         self.max_features = max_features
         self.random_state = random_state
+        self.buffer_size = buffer_size
         self._rng = np.random.default_rng(random_state)
 
         self.impurity = gini if criterion == "gini" else entropy
         self._impurity_from_counts = _gini_from_counts if criterion == "gini" else _entropy_from_counts
 
         self.root: Optional[Node] = None
+        self._n_features_: Optional[int] = None
+        self._buffer_X: list = []
+        self._buffer_y: list = []
+        self._buffer_count = 0
 
     def _best_split_for_feature(self, column: np.ndarray, y: np.ndarray) -> Tuple[Optional[float], float]:
         """
@@ -319,6 +330,54 @@ class DecisionTreeClassifier:
             right=self._build(X[not_mask], y[not_mask], depth + 1),
         )
 
+    def _validate_fit_input(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Shared input checks for fit and partial_fit.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n, D).
+        y : np.ndarray
+            Binary labels (0 or 1), shape (n,).
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            X as float64 and y as int64, both validated.
+
+        Raises
+        ------
+        ValueError
+            If X is not 2D, y is not 1D, their row counts differ, X is
+            empty, X contains non-finite values, y contains labels other
+            than 0 or 1, or X's feature count does not match a previous
+            fit/partial_fit call's.
+
+        Complexity
+        ----------
+        Time: O(n * D). Space: O(n * D) for the cast copies.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y)
+
+        if X.ndim != 2:
+            raise ValueError(f"Expected a 2D array for X, got {X.ndim}D array instead.")
+        if y.ndim != 1:
+            raise ValueError(f"Expected a 1D array for y, got {y.ndim}D array instead.")
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(f"X and y must have the same number of rows: got {X.shape[0]} and {y.shape[0]}.")
+        if X.shape[0] == 0:
+            raise ValueError("Cannot fit on empty data.")
+        if not np.all(np.isfinite(X)):
+            raise ValueError("X must not contain NaN or infinite values.")
+        if not np.all(np.isin(y, [0, 1])):
+            raise ValueError("y must contain only labels 0 or 1.")
+        if self._n_features_ is not None and X.shape[1] != self._n_features_:
+            raise ValueError(f"Feature dimension mismatch: expected {self._n_features_}, got {X.shape[1]}.")
+
+        return X, y.astype(np.int64)
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> "DecisionTreeClassifier":
         """
         Train the tree from scratch on the given data.
@@ -346,24 +405,54 @@ class DecisionTreeClassifier:
         ----------
         Time: O(max_depth * D * n log n). Space: O(n) per level of recursion.
         """
-        X = np.asarray(X, dtype=np.float64)
-        y = np.asarray(y)
-
-        if X.ndim != 2:
-            raise ValueError(f"Expected a 2D array for X, got {X.ndim}D array instead.")
-        if y.ndim != 1:
-            raise ValueError(f"Expected a 1D array for y, got {y.ndim}D array instead.")
-        if X.shape[0] != y.shape[0]:
-            raise ValueError(f"X and y must have the same number of rows: got {X.shape[0]} and {y.shape[0]}.")
-        if X.shape[0] == 0:
-            raise ValueError("Cannot fit on empty data.")
-        if not np.all(np.isfinite(X)):
-            raise ValueError("X must not contain NaN or infinite values.")
-        if not np.all(np.isin(y, [0, 1])):
-            raise ValueError("y must contain only labels 0 or 1.")
-
-        y = y.astype(np.int64)
+        X, y = self._validate_fit_input(X, y)
+        self._n_features_ = X.shape[1]
         self.root = self._build(X, y, 0)
+        return self
+
+    def partial_fit(self, X_chunk: np.ndarray, y_chunk: np.ndarray) -> "DecisionTreeClassifier":
+        """
+        Buffer a new chunk and retrain once the buffer reaches buffer_size.
+
+        Parameters
+        ----------
+        X_chunk : np.ndarray
+            New feature rows, shape (n, D).
+        y_chunk : np.ndarray
+            New binary labels (0 or 1), shape (n,).
+
+        Returns
+        -------
+        DecisionTreeClassifier
+            self, to allow chaining.
+
+        Raises
+        ------
+        ValueError
+            If X_chunk/y_chunk fail the same checks as fit, or their
+            feature count does not match an earlier fit/partial_fit call's.
+
+        Complexity
+        ----------
+        Time: O(n * D) to validate and buffer the chunk, plus
+        O(max_depth * D * buffer_size * log(buffer_size)) on a retrain.
+        """
+        X_chunk, y_chunk = self._validate_fit_input(X_chunk, y_chunk)
+        self._n_features_ = X_chunk.shape[1]
+
+        self._buffer_X.append(X_chunk)
+        self._buffer_y.append(y_chunk)
+        self._buffer_count += X_chunk.shape[0]
+
+        if self._buffer_count >= self.buffer_size:
+            X_buffered = np.vstack(self._buffer_X)
+            y_buffered = np.concatenate(self._buffer_y)
+            self.root = self._build(X_buffered, y_buffered, 0)
+
+            self._buffer_X = []
+            self._buffer_y = []
+            self._buffer_count = 0
+
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
