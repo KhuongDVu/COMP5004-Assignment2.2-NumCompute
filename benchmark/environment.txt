@@ -1,4 +1,4 @@
-Python: 3.14.7
-NumPy: 2.5.4
-Platform: Windows-11-10.0.26200-SP0
-Machine: AMD64
+Python: 3.10.0
+NumPy: 2.2.6
+Platform: macOS-14.2.1-arm64-arm-64bit
+Machine: arm64
