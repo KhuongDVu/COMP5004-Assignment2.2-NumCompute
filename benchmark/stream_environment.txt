@@ -1,0 +1,4 @@
+Python: 3.10.0
+NumPy: 2.2.6
+Platform: macOS-14.2.1-arm64-arm-64bit
+Machine: arm64
